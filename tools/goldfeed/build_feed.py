@@ -338,7 +338,7 @@ def build() -> dict:
 
 
 if __name__ == "__main__":
-    if os.environ.get("DISCOVER"):
+    if os.environ.get("DISCOVER", "").lower() in ("1", "true", "yes"):
         discover()
         sys.exit(0)
     feed = build()
