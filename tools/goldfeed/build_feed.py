@@ -279,42 +279,43 @@ def _get(u: str):
 
 
 def discover():
-    """云端链接发现：打印各目标页面里的真实数据链接，供修正抓取地址。"""
-    print("==== SPDR landing ====", flush=True)
-    for u in ["https://www.spdrgoldshares.com/usa/gld/",
-              "https://www.spdrgoldshares.com/usa/historical-data/",
-              "https://www.spdrgoldshares.com/hong-kong/chinese/historical-data/"]:
-        try:
-            r = _get(u)
-            print("PAGE", u, r.status_code, len(r.content), flush=True)
-            for m in sorted(set(re.findall(r'(?:href|src)=["\']([^"\']+)["\']', r.text))):
-                if re.search(r'xlsx|xls|archive|historical|\.zip', m, re.I):
-                    print("  LINK", m, flush=True)
-        except Exception as e:
-            print("EXC", u, repr(e), flush=True)
-    print("==== PBOC hbtjgl ====", flush=True)
-    u = "http://www.pbc.gov.cn/diaochatongjisi/116219/116319/2026ntjsj/hbtjgl/index.html"
-    try:
-        r = _get(u)
-        print("PAGE", u, r.status_code, len(r.content), flush=True)
-        for href, t in re.findall(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>([\s\S]{0,60}?)</a>', r.text):
-            t = re.sub(r'<[^:]+>', '', t).strip()
-            print("  A", href, "|", t, flush=True)
-        for m in sorted(set(re.findall(r'(?:url|src|action)=["\']([^"\']+)["\']', r.text))):
-            if re.search(r'eportal|json|ajax|list|column|module', m, re.I):
-                print("  EP", m, flush=True)
-    except Exception as e:
-        print("EXC", u, repr(e), flush=True)
-    print("==== gold.org ====", flush=True)
-    u = "https://www.gold.org/goldhub/data/gold-reserves-by-country"
-    try:
-        r = _get(u)
-        print("PAGE", u, r.status_code, len(r.content), flush=True)
-        for m in sorted(set(re.findall(r'(?:href|src)=["\']([^"\']+)["\']', r.text))):
-            if re.search(r'xlsx|xls|download|csv|reserves', m, re.I):
-                print("  LINK", m, flush=True)
-    except Exception as e:
-        print("EXC", u, repr(e), flush=True)
+    """结构深检：打印 SPDR 归档与 PBOC 月度工作簿的真实表结构，供修正解析。"""
+    print("==== SPDR xlsx structure ====", flush=True)
+    u = _spdr_endpoint()
+    r = requests.get(u, headers={**H, "Accept": "*/*"}, timeout=60, verify=False)
+    print("download", r.status_code, r.content[:4], flush=True)
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(r.content), read_only=True, data_only=True)
+    print("sheets:", wb.sheetnames, flush=True)
+    for ws in wb.worksheets[:2]:
+        print("--- sheet:", ws.title, "dims", ws.max_row, ws.max_column, flush=True)
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            if i >= 14:
+                break
+            print(i, [("" if c is None else str(c)[:16]) for c in row][:12], flush=True)
+
+    print("==== PBOC latest workbooks ====", flush=True)
+    base = "http://www.pbc.gov.cn/diaochatongjisi/attachDir/2026/09/"
+    for fn in ["2026093016040859408.xls", "2026093016043439203.xls"]:
+        ar = requests.get(base + fn, headers=H, timeout=40, verify=False)
+        raw = ar.content
+        print("FILE", fn, ar.status_code, raw[:4], flush=True)
+        sheets = []
+        if raw[:2] == b"PK":
+            wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+            sheets = [(s.title, list(s.iter_rows(values_only=True))) for s in wb.worksheets]
+        elif raw[:2] == b"\xd0\xcf":
+            import xlrd
+            bk = xlrd.open_workbook(file_contents=raw)
+            sheets = [(sh.name, [sh.row_values(i) for i in range(sh.nrows)])
+                      for sh in bk.sheets()]
+        print(" sheets:", [s[0] for s in sheets], flush=True)
+        for name, rows in sheets:
+            for i, vals in enumerate(rows):
+                joined = " ".join(str(v) for v in vals)
+                if "黄金" in joined:
+                    print("  [" + name + "] row", i,
+                          [str(v)[:18] for v in vals][:10], flush=True)
 
 
 def build() -> dict:
