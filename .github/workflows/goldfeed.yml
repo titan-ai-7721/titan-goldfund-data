@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: '20 1 * * *'
   workflow_dispatch:
+    inputs:
+      discover:
+        description: '只做链接发现并打印，不发布'
+        type: boolean
+        default: false
 permissions:
   contents: write
 jobs:
@@ -17,6 +22,8 @@ jobs:
         run: pip install -q requests openpyxl xlrd
       - name: build
         working-directory: tools/goldfeed
+        env:
+          DISCOVER: ${{ inputs.discover }}
         run: python build_feed.py
       - name: publish
         working-directory: tools/goldfeed
