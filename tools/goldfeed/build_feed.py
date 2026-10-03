@@ -348,17 +348,18 @@ def discover():
 def build() -> dict:
     etf_rows, etf_src = fetch_etf()
     pboc_lvl, pboc_src = fetch_pboc()
+    etf_rows = sorted(etf_rows, key=lambda r: r[0])  # 统一按日期升序
     # PBOC 换算吨 + 环比
     pboc_rows = []
     prev = None
-    for month, wanoz in pboc_lvl:
+    for month, wanoz in sorted(pboc_lvl, key=lambda r: r[0]):
         tonnes = round(wanoz * WAN_TO_TONNES, 2)
         mom = round(tonnes - prev, 2) if prev is not None else 0.0
         pboc_rows.append([month, wanoz, tonnes, mom])
         prev = tonnes
     return {
         "generated": int(time.time()),
-        "etf": {"source": etf_src, "as_of": etf_rows[0][0] if etf_rows else "",
+        "etf": {"source": etf_src, "as_of": etf_rows[-1][0] if etf_rows else "",
                 "rows": [list(r) for r in etf_rows]},
         "pboc": {"source": pboc_src, "unit": "万盎司",
                  "as_of": pboc_rows[-1][0] if pboc_rows else "", "rows": pboc_rows},
