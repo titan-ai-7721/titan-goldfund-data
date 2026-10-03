@@ -1,0 +1,26 @@
+name: goldfeed
+on:
+  schedule:
+    - cron: '20 1 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  feed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: deps
+        run: pip install -q requests openpyxl xlrd
+      - name: build
+        working-directory: tools/goldfeed
+        run: python build_feed.py
+      - name: publish
+        working-directory: tools/goldfeed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python publish_feed.py
