@@ -18,7 +18,7 @@
 }
 """
 from __future__ import annotations
-import io, json, re, time
+import io, json, os, re, sys, time
 from typing import List, Tuple, Optional
 
 import requests
@@ -202,6 +202,49 @@ def fetch_pboc() -> Tuple[List[Tuple[str, float]], str]:
 
 
 # --------------------------------------------------------------- 组装
+def _get(u: str):
+    return requests.get(u, headers=H, timeout=40, verify=False)
+
+
+def discover():
+    """云端链接发现：打印各目标页面里的真实数据链接，供修正抓取地址。"""
+    print("==== SPDR landing ====", flush=True)
+    for u in ["https://www.spdrgoldshares.com/usa/gld/",
+              "https://www.spdrgoldshares.com/usa/historical-data/",
+              "https://www.spdrgoldshares.com/hong-kong/chinese/historical-data/"]:
+        try:
+            r = _get(u)
+            print("PAGE", u, r.status_code, len(r.content), flush=True)
+            for m in sorted(set(re.findall(r'(?:href|src)=["\']([^"\']+)["\']', r.text))):
+                if re.search(r'xlsx|xls|archive|historical|\.zip', m, re.I):
+                    print("  LINK", m, flush=True)
+        except Exception as e:
+            print("EXC", u, repr(e), flush=True)
+    print("==== PBOC hbtjgl ====", flush=True)
+    u = "http://www.pbc.gov.cn/diaochatongjisi/116219/116319/2026ntjsj/hbtjgl/index.html"
+    try:
+        r = _get(u)
+        print("PAGE", u, r.status_code, len(r.content), flush=True)
+        for href, t in re.findall(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>([\s\S]{0,60}?)</a>', r.text):
+            t = re.sub(r'<[^:]+>', '', t).strip()
+            print("  A", href, "|", t, flush=True)
+        for m in sorted(set(re.findall(r'(?:url|src|action)=["\']([^"\']+)["\']', r.text))):
+            if re.search(r'eportal|json|ajax|list|column|module', m, re.I):
+                print("  EP", m, flush=True)
+    except Exception as e:
+        print("EXC", u, repr(e), flush=True)
+    print("==== gold.org ====", flush=True)
+    u = "https://www.gold.org/goldhub/data/gold-reserves-by-country"
+    try:
+        r = _get(u)
+        print("PAGE", u, r.status_code, len(r.content), flush=True)
+        for m in sorted(set(re.findall(r'(?:href|src)=["\']([^"\']+)["\']', r.text))):
+            if re.search(r'xlsx|xls|download|csv|reserves', m, re.I):
+                print("  LINK", m, flush=True)
+    except Exception as e:
+        print("EXC", u, repr(e), flush=True)
+
+
 def build() -> dict:
     etf_rows, etf_src = fetch_etf()
     pboc_lvl, pboc_src = fetch_pboc()
@@ -223,6 +266,9 @@ def build() -> dict:
 
 
 if __name__ == "__main__":
+    if os.environ.get("DISCOVER"):
+        discover()
+        sys.exit(0)
     feed = build()
     with open("goldfund.json", "w", encoding="utf-8") as f:
         json.dump(feed, f, ensure_ascii=False, indent=1)
