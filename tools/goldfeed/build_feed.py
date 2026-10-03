@@ -62,6 +62,12 @@ def _norm_date(v) -> Optional[str]:
     if v is None:
         return None
     s = str(v).strip()
+    # dd-Mon-yyyy（SPDR 归档格式，如 18-Nov-2004）
+    mn = re.search(r"(\d{1,2})[-\s]([A-Za-z]{3,9})[-\s](\d{4})", s)
+    if mn:
+        mon = _MONTHS.get(mn.group(2)[:3].lower())
+        if mon:
+            return f"{int(mn.group(3)):04d}.{mon:02d}.{int(mn.group(1)):02d}"
     m = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", s)
     if m:
         return f"{int(m.group(1)):04d}.{int(m.group(2)):02d}.{int(m.group(3)):02d}"
@@ -77,26 +83,11 @@ def _norm_date(v) -> Optional[str]:
     return None
 
 
-def _parse_table_rows(raw: bytes) -> List[Tuple[str, float]]:
-    """从 xlsx/xls 字节中解析 (date, tonnes) 序列。"""
-    grid: List[List[object]] = []
-    name = ""
-    try:
-        from openpyxl import load_workbook
-        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
-        ws = wb.worksheets[0]
-        for r in ws.iter_rows(values_only=True):
-            grid.append(list(r))
-        name = "xlsx"
-    except Exception:
-        try:
-            import xlrd
-            book = xlrd.open_workbook(file_contents=raw)
-            sh = book.sheet_by_index(0)
-            grid = [sh.row_values(i) for i in range(sh.nrows)]
-            name = "xls"
-        except Exception:
-            return []
+_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+
+def _extract_grid(grid: List[List[object]]) -> List[Tuple[str, float]]:
     # locate header row
     hi = -1
     date_c = ton_c = oz_c = -1
@@ -133,9 +124,32 @@ def _parse_table_rows(raw: bytes) -> List[Tuple[str, float]]:
                 tonnes = float(row[oz_c]) * OZ_TO_TONNES
             except (TypeError, ValueError):
                 pass
-        if tonnes and 100 < tonnes < 5000:
+        if tonnes and 50 < tonnes < 5000:
             out.append((d, round(tonnes, 3)))
     return out
+
+
+def _parse_table_rows(raw: bytes) -> List[Tuple[str, float]]:
+    """从 xlsx/xls 字节中解析 (date, tonnes) 序列（遍历所有工作表定位归档表）。"""
+    books: List[List[List[object]]] = []
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        for ws in wb.worksheets:
+            books.append([list(r) for r in ws.iter_rows(values_only=True)])
+    except Exception:
+        try:
+            import xlrd
+            book = xlrd.open_workbook(file_contents=raw)
+            sh = book.sheet_by_index(0)
+            books = [[sh.row_values(i) for i in range(sh.nrows)]]
+        except Exception:
+            return []
+    for grid in books:
+        out = _extract_grid(grid)
+        if out:
+            return out
+    return []
 
 
 def _spdr_endpoint() -> str:
@@ -204,13 +218,20 @@ PBOC_BASE = "http://www.pbc.gov.cn"
 
 
 def _parse_pboc_workbook(raw: bytes) -> Tuple[Optional[str], Optional[float]]:
-    """从月度『货币统计概览』工作簿提取 (月份YYYY.MM, 黄金储备万盎司)。"""
+    """从月度『官方储备资产』工作簿提取 (月份YYYY.MM, 黄金储备万盎司)。
+
+    黄金量取『以盎司计算的纯金数量（百万盎司）』行（如 76.73 百万盎司=7673 万盎司），
+    而非黄金市值行（亿美元/亿SDR）。
+    """
     sheets = None
-    try:
-        from openpyxl import load_workbook
-        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
-        sheets = [(ws.title, list(ws.iter_rows(values_only=True))) for ws in wb.worksheets]
-    except Exception:
+    if raw[:2] == b"PK":
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+            sheets = [(ws.title, list(ws.iter_rows(values_only=True))) for ws in wb.worksheets]
+        except Exception:
+            sheets = None
+    if sheets is None:
         try:
             import xlrd
             bk = xlrd.open_workbook(file_contents=raw)
@@ -219,7 +240,7 @@ def _parse_pboc_workbook(raw: bytes) -> Tuple[Optional[str], Optional[float]]:
         except Exception:
             return None, None
     month: Optional[str] = None
-    level: Optional[float] = None
+    mloz: Optional[float] = None
     for _name, rows in sheets:
         for r in rows:
             cells = ["" if c is None else str(c) for c in r]
@@ -228,16 +249,22 @@ def _parse_pboc_workbook(raw: bytes) -> Tuple[Optional[str], Optional[float]]:
                 mm = re.search(r"(20\d{2})\s*年\s*(\d{1,2})\s*月", line)
                 if mm:
                     month = f"{int(mm.group(1)):04d}.{int(mm.group(2)):02d}"
-            if "黄金储备" in line and level is None:
+            if mloz is None and ("纯金数量" in line or "百万盎司" in line
+                                 or "volume in millions" in line.lower()):
                 for c in cells:
-                    for tok in re.findall(r"\d[\d,]*\.?\d*", c):
+                    for tok in re.findall(r"\d+\.?\d*", c):
                         try:
-                            v = float(tok.replace(",", ""))
+                            v = float(tok)
                         except ValueError:
                             continue
-                        if 5000 <= v <= 9999:
-                            level = v
-    return month, level
+                        if 20 <= v <= 200:
+                            mloz = v
+                            break
+                    if mloz is not None:
+                        break
+    if month is None or mloz is None:
+        return month, None
+    return month, round(mloz * 100.0, 1)  # 百万盎司 -> 万盎司
 
 
 def fetch_pboc() -> Tuple[List[Tuple[str, float]], str]:
