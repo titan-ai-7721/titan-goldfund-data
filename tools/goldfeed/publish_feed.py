@@ -93,19 +93,38 @@ class GH:
             raise SystemExit("建 release 失败: " + r.text[:200])
         return r.json()["id"]
 
+    def _list_assets(self, rid):
+        r = self._call("GET", f"{API}/repos/{self.o}/{self.n}/releases/{rid}/assets")
+        return r.json() if r.status_code == 200 else []
+
+    def _purge_asset(self, rid, name, tries=8):
+        """删除同名资产并轮询直到真正消失（删除为最终一致，且旧 URL 易错）。"""
+        for _ in range(tries):
+            assets = self._list_assets(rid)
+            targets = [a for a in assets if a["name"] == name]
+            if not targets:
+                return True
+            for a in targets:
+                self._call("DELETE",
+                           f"{API}/repos/{self.o}/{self.n}/releases/assets/{a['id']}")
+            time.sleep(1.2)
+        return not any(a["name"] == name for a in self._list_assets(rid))
+
     def publish_asset(self, raw: bytes):
         rid = self._release_id()
-        assets = self._call("GET", f"{API}/repos/{self.o}/{self.n}/releases/{rid}/assets")
-        for a in assets.json():
-            if a["name"] == ASSET_NAME:
-                self._call("DELETE", f"{API}/repos/assets/{a['id']}")
+        if not self._purge_asset(rid, ASSET_NAME):
+            raise SystemExit("旧资产未能删除，已取消")
         url = (f"https://uploads.github.com/repos/{self.o}/{self.n}/releases/"
                f"{rid}/assets?name={ASSET_NAME}")
-        r = self.s.post(url, data=raw,
-                        headers={"Content-Type": "application/json"})
-        if r.status_code not in (200, 201):
+        for i in range(4):
+            r = self.s.post(url, data=raw,
+                            headers={"Content-Type": "application/json"})
+            if r.status_code in (200, 201):
+                return r.json()
+            if r.status_code == 422 and i < 3:  # already_exists，再清再传
+                self._purge_asset(rid, ASSET_NAME); time.sleep(1.2); continue
             raise SystemExit("上传资产失败: " + r.text[:200])
-        return r.json()
+        raise SystemExit("上传资产多次失败")
 
 
 def main():
