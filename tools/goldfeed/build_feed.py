@@ -145,8 +145,11 @@ def fetch_etf() -> Tuple[List[Tuple[str, float]], str]:
     for u in SPDR_URLS:
         try:
             r = requests.get(u, headers=H, timeout=45, verify=False)
+            print(f"[diag] ETF {u} -> {r.status_code} bytes {len(r.content)} "
+                  f"magic {r.content[:2]}", flush=True)
             if r.status_code == 200 and r.content[:2] in (b"PK", b"\xd0\xcf"):
                 levels = _parse_table_rows(r.content)
+                print(f"[diag] ETF parsed levels {len(levels)}", flush=True)
                 if len(levels) >= 5:
                     levels.sort(key=lambda x: x[0])
                     changes = []
@@ -154,7 +157,8 @@ def fetch_etf() -> Tuple[List[Tuple[str, float]], str]:
                         changes.append((levels[i][0],
                                         round(levels[i][1] - levels[i - 1][1], 2)))
                     return changes[-25:], "SPDR官方归档(在线)"
-        except Exception:
+        except Exception as e:
+            print("[diag] ETF EXC", u, repr(e), flush=True)
             continue
     return list(ETF_SEED), "内置最近数据(离线)"
 
@@ -167,16 +171,20 @@ def fetch_pboc() -> Tuple[List[Tuple[str, float]], str]:
     """返回 (月末黄金储备万盎司序列(month,level), source)。最佳努力，失败回退。"""
     try:
         r = requests.get(PBOC_LIST, headers=H, timeout=30, verify=False)
+        print("[diag] PBOC list", r.status_code, "bytes", len(r.content), flush=True)
         txt = r.content.decode(r.apparent_encoding or "utf-8", "ignore")
         # 找最新一篇“官方储备资产”文章链接
         items = re.findall(r'href=["\']([^"\']+)["\'][^>]*>([^<]*储备资产[^<]*)<', txt)
+        print("[diag] PBOC items found", len(items), flush=True)
         base = "http://www.pbc.gov.cn"
         latest = None
         for href, _t in items[:6]:
             url = href if href.startswith("http") else base + (href if href.startswith("/") else "/" + href)
             ar = requests.get(url, headers=H, timeout=30, verify=False)
             at = ar.content.decode(ar.apparent_encoding or "utf-8", "ignore")
+            print("[diag] PBOC art", ar.status_code, url, flush=True)
             m = re.search(r"黄金储备[\s\S]{0,120}?([67]\d{2,3}(?:\.\d+)?)\s*万?盎司", at)
+            print("[diag] PBOC match", bool(m), flush=True)
             if m:
                 latest = (url, float(m.group(1)))
                 break
@@ -188,8 +196,8 @@ def fetch_pboc() -> Tuple[List[Tuple[str, float]], str]:
             seed.append((mm, latest[1]))
             seed.sort(key=lambda x: x[0])
             return seed, "中国人民银行(在线·月度)"
-    except Exception:
-        pass
+    except Exception as e:
+        print("[diag] PBOC EXC", repr(e), flush=True)
     return list(PBOC_SEED), "内置官方数据(离线·月度)"
 
 
