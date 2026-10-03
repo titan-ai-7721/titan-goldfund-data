@@ -52,11 +52,9 @@ PBOC_SEED: List[Tuple[str, float]] = [
     ("2026.07", 7608.0), ("2026.08", 7673.0),
 ]
 
-SPDR_URLS = [
-    "https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.xlsx",
-    "https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.xls",
-    "https://www.spdrgoldshares.com/media/GLD/file/GLD_US_archive_EN.xlsx",
-]
+SPDR_ARCHIVE_API = ("https://api.spdrgoldshares.com/api/v1/historical-archive"
+                     "?product=gld&exchange=NYSE&lang=en")
+SPDR_LANDING = "https://www.spdrgoldshares.com/usa/gld/"
 
 
 # --------------------------------------------------------------- SPDR 解析
@@ -140,62 +138,136 @@ def _parse_table_rows(raw: bytes) -> List[Tuple[str, float]]:
     return out
 
 
+def _spdr_endpoint() -> str:
+    """优先已知 API；若官网改版，则从落地页动态提取历史归档端点。"""
+    try:
+        r = requests.get(SPDR_LANDING, headers=H, timeout=40, verify=False)
+        ms = re.findall(r'https://api\.spdrgoldshares\.com/[^"\']+historical-archive[^"\']*',
+                        r.text)
+        if ms:
+            return ms[0].replace("&amp;", "&")
+    except Exception as e:
+        print("[diag] landing EXC", repr(e), flush=True)
+    return SPDR_ARCHIVE_API
+
+
 def fetch_etf() -> Tuple[List[Tuple[str, float]], str]:
     """返回 (每日增减序列(date,change), source)。"""
-    for u in SPDR_URLS:
-        try:
-            r = requests.get(u, headers=H, timeout=45, verify=False)
-            print(f"[diag] ETF {u} -> {r.status_code} bytes {len(r.content)} "
-                  f"magic {r.content[:2]}", flush=True)
-            if r.status_code == 200 and r.content[:2] in (b"PK", b"\xd0\xcf"):
-                levels = _parse_table_rows(r.content)
-                print(f"[diag] ETF parsed levels {len(levels)}", flush=True)
-                if len(levels) >= 5:
-                    levels.sort(key=lambda x: x[0])
-                    changes = []
-                    for i in range(1, len(levels)):
-                        changes.append((levels[i][0],
-                                        round(levels[i][1] - levels[i - 1][1], 2)))
-                    return changes[-25:], "SPDR官方归档(在线)"
-        except Exception as e:
-            print("[diag] ETF EXC", u, repr(e), flush=True)
-            continue
+    u = _spdr_endpoint()
+    try:
+        r = requests.get(u, headers={**H, "Accept": "*/*"}, timeout=60,
+                         verify=False, allow_redirects=True)
+        print("[diag] ETF api", r.status_code, r.headers.get("Content-Type"),
+              "bytes", len(r.content), "magic", r.content[:4], flush=True)
+        raw = r.content if r.content[:2] in (b"PK", b"\xd0\xcf") else None
+        if raw is None:  # 可能返回 JSON，内含下载地址
+            try:
+                j = r.json()
+                print("[diag] ETF json top keys", list(j)[:10], flush=True)
+                cand = []
+
+                def walk(x):
+                    if isinstance(x, dict):
+                        for v in x.values():
+                            walk(v)
+                    elif isinstance(x, list):
+                        for v in x:
+                            walk(v)
+                    elif isinstance(x, str) and re.search(r'https?://.+\.(xlsx|xls)', x, re.I):
+                        cand.append(x)
+                walk(j)
+                if cand:
+                    rr = requests.get(cand[0], headers=H, timeout=60, verify=False)
+                    print("[diag] ETF json url", rr.status_code, rr.content[:2], flush=True)
+                    if rr.content[:2] in (b"PK", b"\xd0\xcf"):
+                        raw = rr.content
+            except Exception as e:
+                print("[diag] ETF body not file/json", repr(e), flush=True)
+        if raw:
+            levels = _parse_table_rows(raw)
+            print("[diag] ETF parsed levels", len(levels), flush=True)
+            if len(levels) >= 5:
+                levels.sort(key=lambda x: x[0])
+                changes = [(levels[i][0],
+                            round(levels[i][1] - levels[i - 1][1], 2))
+                           for i in range(1, len(levels))]
+                return changes[-25:], "SPDR官方归档(在线)"
+    except Exception as e:
+        print("[diag] ETF EXC", repr(e), flush=True)
     return list(ETF_SEED), "内置最近数据(离线)"
 
 
 # --------------------------------------------------------------- 中国央行
-PBOC_LIST = "http://www.pbc.gov.cn/diaochatongjisi/116219/116319/index.html"
+PBOC_HBTJGL = ("http://www.pbc.gov.cn/diaochatongjisi/116219/116319/"
+               "2026ntjsj/hbtjgl/index.html")
+PBOC_BASE = "http://www.pbc.gov.cn"
+
+
+def _parse_pboc_workbook(raw: bytes) -> Tuple[Optional[str], Optional[float]]:
+    """从月度『货币统计概览』工作簿提取 (月份YYYY.MM, 黄金储备万盎司)。"""
+    sheets = None
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        sheets = [(ws.title, list(ws.iter_rows(values_only=True))) for ws in wb.worksheets]
+    except Exception:
+        try:
+            import xlrd
+            bk = xlrd.open_workbook(file_contents=raw)
+            sheets = [(sh.name, [sh.row_values(i) for i in range(sh.nrows)])
+                      for sh in bk.sheets()]
+        except Exception:
+            return None, None
+    month: Optional[str] = None
+    level: Optional[float] = None
+    for _name, rows in sheets:
+        for r in rows:
+            cells = ["" if c is None else str(c) for c in r]
+            line = " ".join(cells)
+            if month is None:
+                mm = re.search(r"(20\d{2})\s*年\s*(\d{1,2})\s*月", line)
+                if mm:
+                    month = f"{int(mm.group(1)):04d}.{int(mm.group(2)):02d}"
+            if "黄金储备" in line and level is None:
+                for c in cells:
+                    for tok in re.findall(r"\d[\d,]*\.?\d*", c):
+                        try:
+                            v = float(tok.replace(",", ""))
+                        except ValueError:
+                            continue
+                        if 5000 <= v <= 9999:
+                            level = v
+    return month, level
 
 
 def fetch_pboc() -> Tuple[List[Tuple[str, float]], str]:
     """返回 (月末黄金储备万盎司序列(month,level), source)。最佳努力，失败回退。"""
     try:
-        r = requests.get(PBOC_LIST, headers=H, timeout=30, verify=False)
-        print("[diag] PBOC list", r.status_code, "bytes", len(r.content), flush=True)
-        txt = r.content.decode(r.apparent_encoding or "utf-8", "ignore")
-        # 找最新一篇“官方储备资产”文章链接
-        items = re.findall(r'href=["\']([^"\']+)["\'][^>]*>([^<]*储备资产[^<]*)<', txt)
-        print("[diag] PBOC items found", len(items), flush=True)
-        base = "http://www.pbc.gov.cn"
-        latest = None
-        for href, _t in items[:6]:
-            url = href if href.startswith("http") else base + (href if href.startswith("/") else "/" + href)
-            ar = requests.get(url, headers=H, timeout=30, verify=False)
-            at = ar.content.decode(ar.apparent_encoding or "utf-8", "ignore")
-            print("[diag] PBOC art", ar.status_code, url, flush=True)
-            m = re.search(r"黄金储备[\s\S]{0,120}?([67]\d{2,3}(?:\.\d+)?)\s*万?盎司", at)
-            print("[diag] PBOC match", bool(m), flush=True)
-            if m:
-                latest = (url, float(m.group(1)))
-                break
-        if latest:
-            seed = list(PBOC_SEED)
-            # 文章月份：取 URL/标题中的年月，缺省用当前月
-            mm = time.strftime("%Y.%m")
-            seed = [r for r in seed if r[0] != mm]
-            seed.append((mm, latest[1]))
-            seed.sort(key=lambda x: x[0])
-            return seed, "中国人民银行(在线·月度)"
+        r = requests.get(PBOC_HBTJGL, headers=H, timeout=40, verify=False)
+        print("[diag] PBOC hbtjgl", r.status_code, "bytes", len(r.content), flush=True)
+        r.encoding = r.apparent_encoding
+        hrefs = re.findall(r'href=["\']([^"\']+\.(?:xlsx|xls))["\']', r.text)
+        cands = []
+        for h in hrefs[-14:]:  # 月度概览块在页面末尾
+            cands.append(h if h.startswith("http")
+                         else PBOC_BASE + (h if h.startswith("/") else "/" + h))
+        cands.sort(key=lambda u: 0 if u.lower().endswith("xlsx") else 1)  # xlsx 优先
+        online = {}
+        for url in cands:
+            try:
+                ar = requests.get(url, headers=H, timeout=40, verify=False)
+                if ar.content[:2] not in (b"PK", b"\xd0\xcf"):
+                    continue
+                month, level = _parse_pboc_workbook(ar.content)
+                print("[diag] PBOC wb", url.split("/")[-1], month, level, flush=True)
+                if level and month:
+                    online.setdefault(month, level)
+            except Exception as e:
+                print("[diag] PBOC wb EXC", repr(e), flush=True)
+        if online:
+            merged = {m: v for m, v in PBOC_SEED}
+            merged.update(online)
+            return sorted(merged.items()), "中国人民银行(在线·月度)"
     except Exception as e:
         print("[diag] PBOC EXC", repr(e), flush=True)
     return list(PBOC_SEED), "内置官方数据(离线·月度)"
